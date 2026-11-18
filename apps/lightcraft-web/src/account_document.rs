@@ -2,6 +2,7 @@
 
 use lightcraft_engine::catalog::PhotoId;
 use lightcraft_ui_egui::LightcraftApp;
+use lightcraft_ui_egui::state::Dialog;
 use serde_json::{Value, json};
 use wasm_bindgen::JsValue;
 
@@ -88,7 +89,7 @@ impl AccountDocument {
     }
 
     fn unfinished(app: &LightcraftApp) -> bool {
-        app.gesture.is_some() || app.ui.dialog.is_some()
+        app.gesture.is_some() || app.ui.dialog.as_ref().is_some_and(|dialog| !matches!(dialog, Dialog::Welcome { .. } | Dialog::WhatsNew))
     }
 
     pub fn suspended(&self) -> bool {
@@ -241,8 +242,8 @@ impl AccountDocument {
             None => target.is_null(),
         };
         let result = (|| {
-            if !valid || self.suspended() || importing || self.pending.is_some() || Self::unfinished(app) {
-                return Err("The scoped operation must target an idle LightCraft library.".to_owned());
+            if !valid || self.suspended() {
+                return Err("The scoped operation must target the open LightCraft library.".to_owned());
             }
             let args = string(packet, "args").filter(|value| value.len() <= 4096).ok_or("Invalid LightCraft operation arguments.")?;
             let args = crate::automation::params(&args)?;
@@ -254,6 +255,9 @@ impl AccountDocument {
                     })).collect::<Vec<_>>(),
                 })),
                 Some("photo.rate") if args.as_object().is_some_and(|args| args.len() == 2) => {
+                    if importing || self.pending.is_some() || Self::unfinished(app) {
+                        return Err("Finish the active LightCraft edit or file operation before rating a photo.".into());
+                    }
                     let ids = args["ids"].as_array().filter(|ids| ids.len() == 1).ok_or("Choose one LightCraft photo.")?;
                     let photo = ids[0]
                         .as_u64()
