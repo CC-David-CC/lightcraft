@@ -14,6 +14,7 @@ use serde_json::json;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
+use crate::account_document::AccountDocument;
 use crate::account_library::AccountLibrary;
 use crate::account_port::{AccountPort, Start};
 use crate::backend::Backend;
@@ -552,6 +553,7 @@ struct WebApp {
     ui_written: Vec<u8>,
     bridge: Option<crate::host::Bridge>,
     account: Option<AccountLibrary>,
+    account_document: Option<AccountDocument>,
 }
 
 /// The browser host's drop queues, taken only through the shared gate: a prompt or blocking
@@ -707,6 +709,10 @@ impl WebApp {
         {
             notice(error);
         }
+        let account_document = account.filter(|_| app.library_problem.is_none()).map(|(library, request)| {
+            library.port.wake_on(cc.egui_ctx.clone());
+            AccountDocument::new(library, request, &app, &files)
+        });
         WebApp {
             app,
             originals,
@@ -724,6 +730,7 @@ impl WebApp {
             ui_written,
             bridge,
             account: account_library,
+            account_document,
         }
     }
 
@@ -915,6 +922,14 @@ pub fn command(id: String, params: String) -> js_sys::Promise {
 }
 
 impl WebApp {
+    fn report_account_document(&mut self) {
+        if let Some(document) = &mut self.account_document
+            && let Err(error) = document.pump(&self.app, &self.files)
+        {
+            log::warn!("LightCraft account document: {error}");
+        }
+    }
+
     fn web_stats(&self) -> serde_json::Value {
         let (alive, ready, remote, inline) = self.workers.as_ref().map_or((0, 0, 0, 0), Workers::stats);
         let (orig_n, orig_bytes) = self.originals.usage();
@@ -971,6 +986,7 @@ impl eframe::App for WebApp {
         }
         self.app.logic(ctx);
         self.save();
+        self.report_account_document();
         if let Some(b) = &self.bridge {
             b.report_dirty(self.dirty_for_host());
         }
@@ -991,8 +1007,10 @@ impl eframe::App for WebApp {
         let ctx = ui.ctx().clone();
         self.import_dropped(&ctx);
         self.app.ui(ui);
+        self.report_account_document();
         // eframe's web runner ignores `ViewportCommand::Title`: name the open photo in the page title
-        let title = self.app.page_title(self.files.is_dirty() || self.flushing.get());
+        let dirty = self.account_document.as_ref().map_or_else(|| self.files.is_dirty() || self.flushing.get(), AccountDocument::dirty);
+        let title = self.app.page_title(dirty);
         if title != self.title
             && let Some(doc) = window().and_then(|w| w.document())
         {

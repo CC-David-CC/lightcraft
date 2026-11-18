@@ -1,10 +1,11 @@
 //! The same-origin account transport. Only the owning Desktop frame may answer requests.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
 use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
+use serde_json::Value;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{MessageEvent, Window};
@@ -21,6 +22,8 @@ struct Transport {
     generation: String,
     sequence: Cell<u64>,
     pending: RefCell<BTreeMap<Request, Function>>,
+    inbox: RefCell<VecDeque<(String, JsValue)>>,
+    ctx: RefCell<Option<egui::Context>>,
 }
 
 struct Listener {
@@ -47,11 +50,11 @@ pub(crate) struct Start {
     pub recover: bool,
 }
 
-fn field(packet: &JsValue, name: &str) -> JsValue {
+pub(crate) fn field(packet: &JsValue, name: &str) -> JsValue {
     Reflect::get(packet, &name.into()).unwrap_or(JsValue::UNDEFINED)
 }
 
-fn string(packet: &JsValue, name: &str) -> Option<String> {
+pub(crate) fn string(packet: &JsValue, name: &str) -> Option<String> {
     field(packet, name).as_string()
 }
 
@@ -85,7 +88,15 @@ impl AccountPort {
             .and_then(|crypto| crypto.get_random_values_with_u8_array(&mut random))
             .map_err(|_| "Could not create an account window identity.")?;
         let generation = random.iter().map(|byte| format!("{byte:02x}")).collect();
-        let transport = Rc::new(Transport { parent, origin, generation, sequence: Cell::new(0), pending: RefCell::default() });
+        let transport = Rc::new(Transport {
+            parent,
+            origin,
+            generation,
+            sequence: Cell::new(0),
+            pending: RefCell::default(),
+            inbox: RefCell::default(),
+            ctx: RefCell::default(),
+        });
         let owner = Rc::downgrade(&transport);
         let callback = Closure::<dyn Fn(MessageEvent)>::new(move |event: MessageEvent| {
             if let Some(owner) = owner.upgrade() {
@@ -100,18 +111,39 @@ impl AccountPort {
 
     fn post(&self, kind: &str, fields: &[(&str, JsValue)], transfer: Option<&ArrayBuffer>) -> Result<(), String> {
         let packet = Object::new();
-        for (name, value) in
-            [("type", format!("{PREFIX}{kind}").into()), ("generation", self.transport.generation.as_str().into())].iter().chain(fields)
-        {
+        for (name, value) in fields {
             Reflect::set(&packet, &(*name).into(), value).map_err(|_| "Could not make the account request.")?;
         }
+        self.post_object(kind, packet.as_ref(), transfer)
+    }
+
+    fn post_object(&self, kind: &str, packet: &JsValue, transfer: Option<&ArrayBuffer>) -> Result<(), String> {
+        Reflect::set(packet, &"type".into(), &format!("{PREFIX}{kind}").into()).map_err(|_| "Could not make the account request.")?;
+        Reflect::set(packet, &"generation".into(), &self.transport.generation.as_str().into()).map_err(|_| "Could not make the account request.")?;
         let parent = &self.transport.parent;
         let origin = &self.transport.origin;
         let sent = match transfer {
-            Some(buffer) => parent.post_message_with_transfer(&packet, origin, &Array::of1(buffer)),
-            None => parent.post_message(&packet, origin),
+            Some(buffer) => parent.post_message_with_transfer(packet, origin, &Array::of1(buffer)),
+            None => parent.post_message(packet, origin),
         };
         sent.map_err(|_| "Could not reach the account window.".into())
+    }
+
+    pub fn publish(&self, kind: &str, data: Value, bytes: Option<Vec<u8>>) -> Result<(), String> {
+        let packet = js_sys::JSON::parse(&data.to_string()).map_err(|_| "Could not encode the account notice.")?;
+        let transfer = bytes.map(|bytes| Uint8Array::from(bytes.as_slice()).buffer());
+        if let Some(buffer) = &transfer {
+            Reflect::set(&packet, &"bytes".into(), buffer.as_ref()).map_err(|_| "Could not encode the account file.")?;
+        }
+        self.post_object(kind, &packet, transfer.as_ref())
+    }
+
+    pub fn wake_on(&self, ctx: egui::Context) {
+        *self.transport.ctx.borrow_mut() = Some(ctx);
+    }
+
+    pub fn take_messages(&self) -> VecDeque<(String, JsValue)> {
+        std::mem::take(&mut *self.transport.inbox.borrow_mut())
     }
 
     fn wait(&self, key: &Request) -> Result<(JsFuture, i32, Closure<dyn FnMut()>), String> {
@@ -230,11 +262,22 @@ impl Transport {
         if !packet.is_object() || string(&packet, "generation").as_deref() != Some(self.generation.as_str()) {
             return;
         }
-        let request = match string(&packet, "type").as_deref().and_then(|kind| kind.strip_prefix(PREFIX)) {
+        let kind = string(&packet, "type");
+        let request = match kind.as_deref().and_then(|kind| kind.strip_prefix(PREFIX)) {
             Some("start") => ("start".into(), String::new()),
             Some("original-result") => {
                 let (Some(operation), Some(request)) = (string(&packet, "operation"), string(&packet, "requestId")) else { return };
                 (operation, request)
+            }
+            Some(kind @ ("recovery-capture" | "autosave" | "session-save" | "save-result")) => {
+                if let Some(ctx) = self.ctx.borrow().as_ref()
+                    && let Ok(mut inbox) = self.inbox.try_borrow_mut()
+                    && inbox.len() < 32
+                {
+                    inbox.push_back((kind.to_owned(), packet));
+                    ctx.request_repaint();
+                }
+                return;
             }
             _ => return,
         };

@@ -4,6 +4,8 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use lightcraft_engine::catalog::Catalog;
+
 use crate::account_catalog;
 use crate::account_port::{AccountPort, Start};
 use crate::backend::Backend;
@@ -75,5 +77,9 @@ impl AccountLibrary {
 
     pub fn retry_later(&self, hash: &str) {
         self.cache.borrow_mut().insert(hash.into(), CacheState::RetryAt(lightcraft_ui_egui::monotonic_ms() + 10_000.0));
+    }
+
+    pub fn capture(&self, catalog: &Catalog, files: &Files) -> Result<Vec<u8>, String> {
+        account_catalog::capture(catalog, files, &self.originals.borrow())
     }
 }

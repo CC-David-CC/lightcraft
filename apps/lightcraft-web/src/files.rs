@@ -51,6 +51,8 @@ struct Mirror {
     dirty: Vec<(String, Dirty)>,
     /// Why the last flush to browser storage failed (quota, eviction…), until one succeeds.
     error: Option<String>,
+    /// Portable settings edits, separate from journal writes and view/UI changes.
+    settings_revision: u64,
 }
 
 impl Mirror {
@@ -87,8 +89,15 @@ impl Files {
     /// Replace a file.
     pub fn write(&self, name: &str, data: &[u8]) {
         let mut m = self.lock();
+        if matches!(name, "presets.json" | "prefs.json") && m.files.get(name).is_none_or(|before| before != data) {
+            m.settings_revision += 1;
+        }
         m.files.insert(name.to_string(), data.to_vec());
         m.mark(name, Dirty::Rewrite);
+    }
+
+    pub fn settings_revision(&self) -> u64 {
+        self.lock().settings_revision
     }
 
     pub fn append(&self, name: &str, data: &[u8]) {

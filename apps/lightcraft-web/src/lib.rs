@@ -37,6 +37,8 @@ pub mod store;
 pub mod wire;
 
 #[cfg(target_arch = "wasm32")]
+mod account_document;
+#[cfg(target_arch = "wasm32")]
 mod account_library;
 #[cfg(target_arch = "wasm32")]
 mod account_port;
