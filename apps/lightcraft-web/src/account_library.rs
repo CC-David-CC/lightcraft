@@ -1,6 +1,6 @@
 //! Account project metadata and immutable originals for a single LightCraft window.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -17,6 +17,17 @@ pub(crate) struct AccountLibrary {
     pub port: AccountPort,
     originals: Rc<RefCell<BTreeMap<String, String>>>,
     cache: Rc<RefCell<BTreeMap<String, CacheState>>>,
+    imports: Rc<Cell<usize>>,
+    suspended: Rc<Cell<bool>>,
+}
+
+pub(crate) struct ImportGuard(Rc<Cell<usize>>);
+
+impl Drop for ImportGuard {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+        crate::web::request_repaint();
+    }
 }
 
 enum CacheState {
@@ -33,7 +44,10 @@ impl AccountLibrary {
             }
             None => (Files::default(), BTreeMap::new()),
         };
-        Ok((Self { port, originals: Rc::new(RefCell::new(originals)), cache: Rc::default() }, files))
+        Ok((
+            Self { port, originals: Rc::new(RefCell::new(originals)), cache: Rc::default(), imports: Rc::default(), suspended: Rc::default() },
+            files,
+        ))
     }
 
     pub async fn store_original(&self, hash: &str, bytes: &[u8]) -> Result<(), String> {
@@ -81,5 +95,22 @@ impl AccountLibrary {
 
     pub fn capture(&self, catalog: &Catalog, files: &Files) -> Result<Vec<u8>, String> {
         account_catalog::capture(catalog, files, &self.originals.borrow())
+    }
+
+    pub fn begin_import(&self) -> Option<ImportGuard> {
+        if self.suspended.get() {
+            return None;
+        }
+        self.imports.set(self.imports.get() + 1);
+        crate::web::request_repaint();
+        Some(ImportGuard(self.imports.clone()))
+    }
+
+    pub fn importing(&self) -> bool {
+        self.imports.get() > 0
+    }
+
+    pub fn suspend(&self, value: bool) {
+        self.suspended.set(value);
     }
 }

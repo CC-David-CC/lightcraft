@@ -145,6 +145,10 @@ impl Originals {
         std::mem::take(&mut self.lock().pending)
     }
 
+    pub fn has_pending(&self) -> bool {
+        !self.lock().pending.is_empty()
+    }
+
     /// (originals in memory, bytes).
     pub fn usage(&self) -> (usize, usize) {
         let g = self.lock();

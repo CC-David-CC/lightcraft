@@ -269,7 +269,7 @@ impl Transport {
                 let (Some(operation), Some(request)) = (string(&packet, "operation"), string(&packet, "requestId")) else { return };
                 (operation, request)
             }
-            Some(kind @ ("recovery-capture" | "autosave" | "session-save" | "save-result")) => {
+            Some(kind @ ("recovery-capture" | "autosave" | "session-save" | "save-result" | "session" | "operation")) => {
                 if let Some(ctx) = self.ctx.borrow().as_ref()
                     && let Ok(mut inbox) = self.inbox.try_borrow_mut()
                     && inbox.len() < 32

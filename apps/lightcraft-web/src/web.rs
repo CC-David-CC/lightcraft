@@ -178,7 +178,15 @@ fn open_picker(originals: Originals, backend: Option<Backend>, account: Option<A
         if let Some(files) = inp.files() {
             for i in 0..files.length() {
                 if let Some(f) = files.get(i) {
-                    wasm_bindgen_futures::spawn_local(read_file(originals.clone(), backend.clone(), account.clone(), f, ctx.clone()));
+                    let import = account.as_ref().map(AccountLibrary::begin_import);
+                    if matches!(import, Some(None)) {
+                        return;
+                    }
+                    let (originals, backend, account, ctx) = (originals.clone(), backend.clone(), account.clone(), ctx.clone());
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let _import = import;
+                        read_file(originals, backend, account, f, ctx).await;
+                    });
                 }
             }
         }
@@ -790,7 +798,12 @@ impl WebApp {
         for f in drained.dropped {
             let (originals, backend, ctx) = (self.originals.clone(), self.backend.clone(), ctx.clone());
             let account = self.account.clone();
+            let import = account.as_ref().map(AccountLibrary::begin_import);
+            if matches!(import, Some(None)) {
+                continue;
+            }
             wasm_bindgen_futures::spawn_local(async move {
+                let _import = import;
                 let name = egui::DroppedFile::path(f.as_ref()).to_string_lossy().to_string();
                 match egui::DroppedFile::bytes_async(f.as_ref()).await {
                     Ok(bytes) => store_file(originals, backend, account, name, bytes, ctx).await,
@@ -924,10 +937,14 @@ pub fn command(id: String, params: String) -> js_sys::Promise {
 impl WebApp {
     fn report_account_document(&mut self) {
         if let Some(document) = &mut self.account_document
-            && let Err(error) = document.pump(&self.app, &self.files)
+            && let Err(error) = document.pump(&mut self.app, &self.files, self.originals.has_pending())
         {
             log::warn!("LightCraft account document: {error}");
         }
+    }
+
+    fn suspended(&self) -> bool {
+        self.account_document.as_ref().is_some_and(AccountDocument::suspended)
     }
 
     fn web_stats(&self) -> serde_json::Value {
@@ -972,6 +989,10 @@ impl eframe::App for WebApp {
     /// eframe's non-drawing pass for the browser host: drain safety notices and queued inbox work,
     /// load originals the UI requested, apply the cache budget, run the app's logic, then save.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.report_account_document();
+        if self.suspended() {
+            return;
+        }
         for text in safety::take_notices() {
             let now = self.app.tick_now();
             self.app.ui.toast = Some((text, now + NOTICE_SECS, None));
@@ -995,12 +1016,20 @@ impl eframe::App for WebApp {
     /// Pass the browser's raw input to the app hook before egui processes it, so prompt barriers
     /// and synthetic or dropped input are applied consistently with the desktop host.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
-        self.app.raw_input_hook(ctx, raw);
+        if self.suspended() {
+            raw.events.clear();
+            raw.dropped_files.clear();
+        } else {
+            self.app.raw_input_hook(ctx, raw);
+        }
     }
 
     /// eframe's UI pass: import queued drops unless a prompt blocks input, draw the app, update the
     /// page title, and advance the benchmark once per root pass.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.suspended() {
+            return;
+        }
         // Drops are the UI phase's: a hidden `logic`/`run_logic` tick must not import them twice.
         // `import_dropped` itself takes both queues only through the gate, so a prompt or the
         // blocking library window (over an already open library) keeps a stored drop queued.
@@ -1117,7 +1146,7 @@ pub fn start(chinese_font: Vec<u8>) {
     }
     wasm_bindgen_futures::spawn_local(async move {
         // one tab per library: two would each keep their own copy and overwrite each other's saves
-        if opts.store != "memory" && safety::acquire_tab_lock(opts.scope.as_ref()).await == Some(false) {
+        if account.is_none() && opts.store != "memory" && safety::acquire_tab_lock(opts.scope.as_ref()).await == Some(false) {
             let message =
                 "LightCraft is already open in another tab or window of this browser. Switch to that tab, or close it and reload this page.";
             safety::show_blocking(message);

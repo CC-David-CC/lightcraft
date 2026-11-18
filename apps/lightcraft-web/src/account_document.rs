@@ -1,11 +1,12 @@
 //! Versioned account snapshots of the editor's native catalog.
 
+use lightcraft_engine::catalog::PhotoId;
 use lightcraft_ui_egui::LightcraftApp;
 use serde_json::{Value, json};
 use wasm_bindgen::JsValue;
 
 use crate::account_library::AccountLibrary;
-use crate::account_port::{Start, string};
+use crate::account_port::{Start, field, string};
 use crate::files::Files;
 
 const DOCUMENT_ID: &str = "1";
@@ -54,6 +55,8 @@ pub(crate) struct AccountDocument {
     ticket: u64,
     pending: Option<Save>,
     last_status: Option<Value>,
+    lease: Option<String>,
+    finalized: bool,
 }
 
 impl AccountDocument {
@@ -67,6 +70,8 @@ impl AccountDocument {
             ticket: 0,
             pending: None,
             last_status: None,
+            lease: None,
+            finalized: false,
         }
     }
 
@@ -86,7 +91,11 @@ impl AccountDocument {
         app.gesture.is_some() || app.ui.dialog.is_some()
     }
 
-    fn status(&self, app: &LightcraftApp) -> Value {
+    pub fn suspended(&self) -> bool {
+        self.lease.is_some()
+    }
+
+    fn status(&self, app: &LightcraftApp, importing: bool) -> Value {
         let unfinished = Self::unfinished(app);
         json!({
             "documentId":DOCUMENT_ID,
@@ -95,7 +104,7 @@ impl AccountDocument {
             "dirty":self.dirty(),
             "unfinishedEdit":unfinished,
             "capturable":!unfinished,
-            "operationPending":self.pending.is_some(),
+            "operationPending":self.pending.is_some() || importing,
         })
     }
 
@@ -120,7 +129,7 @@ impl AccountDocument {
         self.library.port.publish("recovery-captured", reply, bytes)
     }
 
-    fn capture(&mut self, kind: &str, packet: &JsValue, app: &LightcraftApp, files: &Files) -> Result<(), String> {
+    fn capture(&mut self, kind: &str, packet: &JsValue, app: &LightcraftApp, files: &Files, importing: bool) -> Result<(), String> {
         let requested = integer(packet, "revision");
         let path = string(packet, "path");
         let mut reply = json!({
@@ -133,6 +142,8 @@ impl AccountDocument {
         });
         let response = if kind == "autosave" { "autosave-result" } else { "session-save-result" };
         if self.pending.is_some()
+            || importing
+            || self.suspended()
             || Self::unfinished(app)
             || requested != Some(self.local)
             || kind == "autosave" && (!self.dirty() || self.path != path)
@@ -161,7 +172,7 @@ impl AccountDocument {
         Ok(())
     }
 
-    fn finish(&mut self, packet: &JsValue, app: &LightcraftApp) -> Result<(), String> {
+    fn finish(&mut self, packet: &JsValue, app: &LightcraftApp, importing: bool) -> Result<(), String> {
         let Some(key) = Save::read(packet) else { return Ok(()) };
         if self.pending.as_ref() != Some(&key) {
             return Ok(());
@@ -179,24 +190,113 @@ impl AccountDocument {
         self.pending = None;
         let mut response = key.packet();
         response["adopted"] = json!(adopted);
-        response["projectState"] = self.status(app);
+        response["projectState"] = self.status(app, importing);
         self.library.port.publish("save-settled", response, None)
     }
 
-    pub fn pump(&mut self, app: &LightcraftApp, files: &Files) -> Result<(), String> {
+    fn session(&mut self, packet: &JsValue, app: &LightcraftApp, importing: bool) -> Result<(), String> {
+        let operation = string(packet, "operation");
+        let lease = string(packet, "lease").filter(|value| value.len() == 36);
+        let matches = lease.is_some() && self.lease == lease && !self.finalized;
+        let ok = match operation.as_deref() {
+            Some("pause")
+                if lease.is_some()
+                    && !self.suspended()
+                    && !importing
+                    && self.pending.is_none()
+                    && string(packet, "documentId").as_deref() == Some(DOCUMENT_ID)
+                    && integer(packet, "revision") == Some(self.local)
+                    && field(packet, "dirty").as_bool() == Some(self.dirty())
+                    && field(packet, "unfinishedEdit").as_bool() == Some(Self::unfinished(app)) =>
+            {
+                self.library.suspend(true);
+                self.lease = lease.clone();
+                true
+            }
+            Some("release") if matches => {
+                self.lease = None;
+                self.library.suspend(false);
+                true
+            }
+            Some("finalize") if matches => {
+                self.finalized = true;
+                true
+            }
+            _ => false,
+        };
+        self.library.port.publish(
+            "session-result",
+            json!({
+                "requestId":string(packet,"requestId"), "operation":operation,"lease":lease,"ok":ok,
+                "message":if ok { None } else { Some("The LightCraft library changed or the session lease is unavailable.") },
+            }),
+            None,
+        )
+    }
+
+    fn operation(&self, packet: &JsValue, app: &mut LightcraftApp, importing: bool) -> Result<(), String> {
+        let target = field(packet, "path");
+        let valid = match &self.path {
+            Some(path) => target.as_string().as_ref() == Some(path),
+            None => target.is_null(),
+        };
+        let result = (|| {
+            if !valid || self.suspended() || importing || self.pending.is_some() || Self::unfinished(app) {
+                return Err("The scoped operation must target an idle LightCraft library.".to_owned());
+            }
+            let args = string(packet, "args").filter(|value| value.len() <= 4096).ok_or("Invalid LightCraft operation arguments.")?;
+            let args = crate::automation::params(&args)?;
+            match string(packet, "command").as_deref() {
+                Some("document.inspect") if args.as_object().is_some_and(|args| args.is_empty()) => Ok(json!({
+                    "path":self.path, "revision":self.local.to_string(), "photoCount":app.session.catalog.len(),
+                    "photos":app.session.catalog.photos().take(256).map(|photo| json!({
+                        "id":photo.id.0, "name":photo.file_name, "rating":photo.rating,
+                    })).collect::<Vec<_>>(),
+                })),
+                Some("photo.rate") if args.as_object().is_some_and(|args| args.len() == 2) => {
+                    let ids = args["ids"].as_array().filter(|ids| ids.len() == 1).ok_or("Choose one LightCraft photo.")?;
+                    let photo = ids[0]
+                        .as_u64()
+                        .filter(|id| *id <= 9_007_199_254_740_991)
+                        .and_then(|id| app.session.catalog.photo(PhotoId(id)))
+                        .ok_or("That photo is absent from the library.")?;
+                    let rating = args["rating"].as_u64().filter(|rating| *rating <= 5).ok_or("Choose a rating from zero to five.")?;
+                    app.run("photo.rate", json!({"ids":[photo.id.0],"rating":rating}))
+                }
+                _ => Err("This LightCraft operation is unavailable.".into()),
+            }
+        })();
+        let mut response = json!({"requestId":string(packet,"requestId"),"documentId":DOCUMENT_ID});
+        match result {
+            Ok(value) => response["result"] = json!(value.to_string()),
+            Err(error) => response["message"] = json!(error),
+        }
+        self.library.port.publish("operation-result", response, None)
+    }
+
+    pub fn pump(&mut self, app: &mut LightcraftApp, files: &Files, queued_original: bool) -> Result<(), String> {
+        let importing = self.library.importing() || queued_original;
         self.refresh_revision(app, files);
         for (kind, packet) in self.library.port.take_messages() {
+            if kind == "session" {
+                self.session(&packet, app, importing)?;
+                continue;
+            }
             if string(&packet, "documentId").as_deref() != Some(DOCUMENT_ID) {
                 continue;
             }
             match kind.as_str() {
                 "recovery-capture" => self.recover(&packet, app, files)?,
-                "autosave" | "session-save" => self.capture(&kind, &packet, app, files)?,
-                "save-result" => self.finish(&packet, app)?,
+                "autosave" | "session-save" => self.capture(&kind, &packet, app, files, importing)?,
+                "save-result" => self.finish(&packet, app, importing)?,
+                "operation" => {
+                    self.operation(&packet, app, importing)?;
+                    self.refresh_revision(app, files);
+                }
                 _ => {}
             }
         }
-        let status = self.status(app);
+        let status = self.status(app, importing);
         if self.last_status.as_ref() != Some(&status) {
             self.library.port.publish("project-state", status.clone(), None)?;
             self.last_status = Some(status);
