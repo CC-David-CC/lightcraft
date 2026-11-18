@@ -54,17 +54,30 @@ thread_local! {
 }
 
 /// Entry point of a render worker (called by `worker.js` after instantiating the module).
-/// `store` is the backend kind the page uses ("opfs", "idb" or "memory").
+/// `store` identifies the page's backend and, for an account library, its namespace.
 #[wasm_bindgen]
 pub fn worker_main(store: String) {
     eframe::WebLogger::init(log::LevelFilter::Info).ok();
     let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
     // The main thread sends jobs only after "ready", i.e. once storage is open, and one at a time.
     wasm_bindgen_futures::spawn_local(async move {
-        let backend = match store.as_str() {
-            "memory" => None,
-            _ => Backend::open(store == "idb").await.map_err(|e| log::warn!("render worker: no storage ({e})")).ok(),
+        let (kind, library_scope) = match crate::storage_scope::StorageScope::parse_worker_store(&store) {
+            Ok(value) => value,
+            Err(e) => {
+                log::warn!("render worker: {e}");
+                return;
+            }
         };
+        let backend = match kind {
+            "memory" => None,
+            _ => Backend::open(kind == "idb", library_scope.as_ref()).await.map_err(|e| log::warn!("render worker: no storage ({e})")).ok(),
+        };
+        if library_scope.is_some() && backend.as_ref().map(Backend::kind) != Some(kind) {
+            let failure = Object::new();
+            set(&failure, "startupError", &"Could not open the account's original cache in this worker.".into());
+            let _ = scope.post_message(&failure);
+            return;
+        }
         let s = scope.clone();
         let onmessage = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
             let (s, b) = (s.clone(), backend.clone());
@@ -186,6 +199,7 @@ struct Inner {
     budget: u64,
     backend: Option<Backend>,
     ctx: egui::Context,
+    account_originals: Option<(crate::account_library::AccountLibrary, crate::store::Originals)>,
     /// Jobs finished by workers / inline (for diagnostics).
     remote_done: u64,
     inline_done: u64,
@@ -232,6 +246,7 @@ impl Workers {
         cache: &Arc<PreviewCache>,
         budget: u64,
         ctx: egui::Context,
+        account_originals: Option<(crate::account_library::AccountLibrary, crate::store::Originals)>,
     ) -> Workers {
         let w = Workers(Rc::new(RefCell::new(Inner {
             preview_generation: CacheWatch::new(cache),
@@ -243,6 +258,7 @@ impl Workers {
             budget,
             backend,
             ctx,
+            account_originals,
             remote_done: 0,
             inline_done: 0,
             inline_this_frame: false,
@@ -327,6 +343,12 @@ impl Workers {
     }
 
     fn on_message(&self, i: usize, data: JsValue) {
+        if let Some(message) = get(&data, "startupError").as_string() {
+            let error = Object::new();
+            set(&error, "message", &message.into());
+            self.on_error(i, error.into());
+            return;
+        }
         let mut g = self.0.borrow_mut();
         let g = &mut *g;
         g.ctx.request_repaint();
@@ -445,6 +467,16 @@ impl RenderOffload for Workers {
     fn try_start(&mut self, slot: Slot, job: RenderJob) -> Option<RenderJob> {
         let mut g = self.0.borrow_mut();
         let g = &mut *g;
+        if let Some((account, originals)) = &g.account_originals
+            && let lightcraft_engine::catalog::Source::File { path } = &job.origin
+            && let Some(hash) = crate::store::hash_of_path(path)
+            && !account.is_cached(hash)
+        {
+            if account.can_retry(hash) && originals.prefetch(path) {
+                g.ctx.request_repaint();
+            }
+            return Some(job);
+        }
         if let Some((cache, _)) = job.cache.as_ref().or(job.view_cache.as_ref()) {
             g.observe_cache(cache, job.cache_generation);
         }

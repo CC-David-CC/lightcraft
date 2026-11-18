@@ -9,6 +9,8 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetDirectoryOptions, FileSystemGetFileOptions, IdbDatabase};
 
+use crate::storage_scope::StorageScope;
+
 const IDB_NAME: &str = "lightcraft";
 const IDB_STORE: &str = "files";
 
@@ -92,22 +94,32 @@ async fn idb_done(tx: &web_sys::IdbTransaction) -> Result<(), String> {
 
 impl Backend {
     /// OPFS if writable from here (unless `prefer_idb`), else IndexedDB.
-    pub async fn open(prefer_idb: bool) -> Result<Backend, String> {
+    pub async fn open(prefer_idb: bool, scope: Option<&StorageScope>) -> Result<Backend, String> {
         if !prefer_idb
             && opfs_writable()
             && let Some(sm) = storage_manager()
         {
             match JsFuture::from(sm.get_directory()).await {
-                Ok(root) => return Ok(Backend::Opfs(root.unchecked_into())),
+                Ok(root) => {
+                    let root: FileSystemDirectoryHandle = root.unchecked_into();
+                    let Some(scope) = scope else { return Ok(Backend::Opfs(root)) };
+                    let options = FileSystemGetDirectoryOptions::new();
+                    options.set_create(true);
+                    match JsFuture::from(root.get_directory_handle_with_options(&scope.name(), &options)).await {
+                        Ok(directory) => return Ok(Backend::Opfs(directory.unchecked_into())),
+                        Err(e) => log::warn!("Library OPFS unavailable ({}); using scoped IndexedDB", err(e)),
+                    }
+                }
                 Err(e) => log::warn!("OPFS unavailable ({}); using IndexedDB", err(e)),
             }
         }
-        Self::open_idb().await
+        let database = scope.map_or_else(|| IDB_NAME.to_owned(), StorageScope::name);
+        Self::open_idb(&database).await
     }
 
-    async fn open_idb() -> Result<Backend, String> {
+    async fn open_idb(database: &str) -> Result<Backend, String> {
         let f = indexed_db().ok_or("no IndexedDB")?;
-        let req = f.open_with_u32(IDB_NAME, 1).map_err(err)?;
+        let req = f.open_with_u32(database, 1).map_err(err)?;
         let upgrade = Closure::<dyn FnMut(web_sys::IdbVersionChangeEvent)>::new(move |e: web_sys::IdbVersionChangeEvent| {
             if let Some(db) = e.target().and_then(|t| t.dyn_into::<web_sys::IdbOpenDbRequest>().ok()).and_then(|r| r.result().ok()) {
                 let db: IdbDatabase = db.unchecked_into();
@@ -292,7 +304,9 @@ impl Backend {
     pub async fn clear(&self) -> Result<(), String> {
         match self {
             Backend::Opfs(root) => {
-                for name in dir_keys(root).await? {
+                for name in dir_keys(root).await?.into_iter().filter(|name| {
+                    name == crate::backup::ACTIVE_LIBRARY || name == "thumbs" || name == "originals" || crate::backup::valid_library_dir(name)
+                }) {
                     let opts = web_sys::FileSystemRemoveOptions::new();
                     opts.set_recursive(true);
                     JsFuture::from(root.remove_entry_with_options(&name, &opts)).await.map_err(err)?;

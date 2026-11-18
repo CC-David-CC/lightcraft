@@ -14,6 +14,8 @@ use serde_json::json;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
+use crate::account_library::AccountLibrary;
+use crate::account_port::{AccountPort, Start};
 use crate::backend::Backend;
 use crate::backup::{ACTIVE_LIBRARY, DEFAULT_LIBRARY_DIR, valid_library_dir};
 use crate::bench::Bench;
@@ -78,10 +80,11 @@ struct Options {
     reset: bool,
     /// The raw query string, for the host mode ([`crate::host::transport_for`]).
     query: String,
+    scope: Option<crate::storage_scope::StorageScope>,
 }
 
 impl Options {
-    fn from_url() -> Options {
+    fn from_url() -> Result<Options, &'static str> {
         let q = window().and_then(|w| w.location().search().ok()).unwrap_or_default();
         let params: Vec<(String, String)> = q
             .trim_start_matches('?')
@@ -93,22 +96,49 @@ impl Options {
             })
             .collect();
         let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-        let bench = get("bench").is_some();
-        Options {
+        let scope = if get("host").as_deref() == Some("webos-account") {
+            let scope = get("scope")
+                .and_then(|value| crate::storage_scope::StorageScope::parse(&value))
+                .ok_or("The WebOS window did not identify this account library.")?;
+            Some(scope)
+        } else {
+            None
+        };
+        let bench = scope.is_none() && get("bench").is_some();
+        let store = get("store").filter(|s| s == "idb" || s == "memory" && scope.is_none());
+        Ok(Options {
             bench,
             // the benchmark edits the first photo it finds: a link with `?bench` must never reach
             // the library in browser storage, so it always runs on the demo photos in an unsaved library
-            store: if bench { "memory".into() } else { get("store").filter(|s| s == "idb" || s == "memory").unwrap_or_else(|| "opfs".into()) },
+            store: if bench { "memory".into() } else { store.unwrap_or_else(|| "opfs".into()) },
             workers: get("workers").and_then(|v| v.parse().ok()).map(|n: usize| n.min(crate::workers::MAX_WORKERS)),
-            reset: get("reset").is_some(),
+            reset: scope.is_none() && get("reset").is_some(),
             query: q,
-        }
+            scope,
+        })
     }
 }
 
 /// Store a picked/dropped file (bytes into browser storage, then queue its import).
-async fn store_file(originals: Originals, backend: Option<Backend>, name: String, bytes: Vec<u8>, ctx: egui::Context) {
+async fn store_file(
+    originals: Originals,
+    backend: Option<Backend>,
+    account: Option<AccountLibrary>,
+    name: String,
+    bytes: Vec<u8>,
+    ctx: egui::Context,
+) {
     let hash = content_hash(&bytes);
+    if let Some(account) = &account {
+        if let Err(error) = lightcraft_engine::files::probe_bytes(&name, &bytes) {
+            notice(format!("{name} could not be imported: {error}"));
+            return;
+        }
+        if let Err(error) = account.store_original(&hash, &bytes).await {
+            notice(format!("{name} could not be stored in your account: {error}"));
+            return;
+        }
+    }
     if let Some(b) = &backend
         && let Err(e) = b.write(&storage_key(&hash), &bytes).await
     {
@@ -116,20 +146,27 @@ async fn store_file(originals: Originals, backend: Option<Backend>, name: String
         notice(format!("{name} was not added: browser storage refused it ({e}). Free up space or back up and clear old photos."));
         return;
     }
+    if let Some(account) = account {
+        account.cached(&hash);
+    }
     originals.added(&name, &hash, Arc::from(bytes));
     ctx.request_repaint();
 }
 
 /// Read a browser `File` into storage.
-async fn read_file(originals: Originals, backend: Option<Backend>, file: web_sys::File, ctx: egui::Context) {
+async fn read_file(originals: Originals, backend: Option<Backend>, account: Option<AccountLibrary>, file: web_sys::File, ctx: egui::Context) {
+    if account.is_some() && file.size() > 128.0 * 1024.0 * 1024.0 {
+        notice(format!("{} exceeds the 128 MiB account file size limit.", file.name()));
+        return;
+    }
     match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
-        Ok(buf) => store_file(originals, backend, file.name(), js_sys::Uint8Array::new(&buf).to_vec(), ctx).await,
+        Ok(buf) => store_file(originals, backend, account, file.name(), js_sys::Uint8Array::new(&buf).to_vec(), ctx).await,
         Err(e) => log::warn!("reading {}: {e:?}", file.name()),
     }
 }
 
 /// Show the browser's open dialog; picked files are imported asynchronously.
-fn open_picker(originals: Originals, backend: Option<Backend>, ctx: egui::Context) {
+fn open_picker(originals: Originals, backend: Option<Backend>, account: Option<AccountLibrary>, ctx: egui::Context) {
     let Some(doc) = window().and_then(|w| w.document()) else { return };
     let Ok(input) = doc.create_element("input").map(|e| e.unchecked_into::<web_sys::HtmlInputElement>()) else { return };
     input.set_type("file");
@@ -140,7 +177,7 @@ fn open_picker(originals: Originals, backend: Option<Backend>, ctx: egui::Contex
         if let Some(files) = inp.files() {
             for i in 0..files.length() {
                 if let Some(f) = files.get(i) {
-                    wasm_bindgen_futures::spawn_local(read_file(originals.clone(), backend.clone(), f, ctx.clone()));
+                    wasm_bindgen_futures::spawn_local(read_file(originals.clone(), backend.clone(), account.clone(), f, ctx.clone()));
                 }
             }
         }
@@ -236,6 +273,7 @@ fn services(
     frozen: Rc<Cell<bool>>,
     ctx: egui::Context,
     bridge: Option<crate::host::Bridge>,
+    account: Option<AccountLibrary>,
 ) -> Services {
     let (backup_backend, backup_files, backup_bridge) = (backend.clone(), files, bridge.clone());
     let restore_backend = backend.clone();
@@ -294,7 +332,7 @@ fn services(
             Ok(json!({"started": true}))
         })),
         pick_files: Some(Box::new(move || {
-            open_picker(originals.clone(), backend.clone(), ctx.clone());
+            open_picker(originals.clone(), backend.clone(), account.clone(), ctx.clone());
             Vec::new() // files arrive asynchronously and are imported on a later frame
         })),
         pick_denoise_model: None,
@@ -380,6 +418,7 @@ struct Boot {
     lib_dir: String,
     /// The page framing LightCraft (`?host=parent`), when there is one.
     bridge: Option<crate::host::Bridge>,
+    account: Option<(AccountLibrary, Start)>,
     /// Library files that exist but couldn't be read (#1507): the library isn't opened and
     /// nothing is saved, so the stored copy stays as it was.
     load_error: Option<String>,
@@ -387,13 +426,17 @@ struct Boot {
 
 async fn boot(opts: Options, bridge: Option<crate::host::Bridge>) -> Boot {
     let t0 = perf_now();
+    let mut load_error = None;
     let backend = if opts.store == "memory" {
         None
     } else {
-        match Backend::open(opts.store == "idb").await {
+        match Backend::open(opts.store == "idb", opts.scope.as_ref()).await {
             Ok(b) => Some(b),
             Err(e) => {
                 log::error!("no browser storage ({e}); this session won't be saved");
+                if opts.scope.is_some() {
+                    load_error = Some(format!("Could not open the browser cache for this account library ({e})"));
+                }
                 None
             }
         }
@@ -401,7 +444,6 @@ async fn boot(opts: Options, bridge: Option<crate::host::Bridge>) -> Boot {
     let files = Files::default();
     let mut index = ThumbIndex::default();
     let mut lib_dir = DEFAULT_LIBRARY_DIR.to_string();
-    let mut load_error = None;
     if let Some(b) = &backend {
         if opts.reset {
             // everything this site keeps in the browser, photos included: never without asking
@@ -418,26 +460,28 @@ async fn boot(opts: Options, bridge: Option<crate::host::Bridge>) -> Boot {
                 log::info!("lightcraft: ?reset declined; storage kept");
             }
         }
-        // a restored backup lives in its own folder (see `backup`)
-        match b.read(ACTIVE_LIBRARY).await {
-            Ok(Some(d)) => {
-                let d = String::from_utf8_lossy(&d).trim().to_string();
-                if valid_library_dir(&d) {
-                    lib_dir = d;
+        if opts.scope.is_none() {
+            // A restored standalone backup lives in its own folder (see `backup`).
+            match b.read(ACTIVE_LIBRARY).await {
+                Ok(Some(d)) => {
+                    let d = String::from_utf8_lossy(&d).trim().to_string();
+                    if valid_library_dir(&d) {
+                        lib_dir = d;
+                    }
                 }
+                Ok(None) => {}
+                // Not knowing which library is in use, any library opened could be the wrong one.
+                Err(e) => load_error = Some(format!("couldn't read which library is in use from browser storage ({e})")),
             }
-            Ok(None) => {}
-            // not knowing which library is in use, any library opened could be the wrong one
-            Err(e) => load_error = Some(format!("couldn't read which library is in use from browser storage ({e})")),
-        }
-        if load_error.is_none() {
-            let mut reads = Vec::new();
-            for name in LIBRARY_FILES {
-                reads.push((name, b.read(&library_key(&lib_dir, name)).await));
-            }
-            if let Err(e) = crate::files::preload_library(&files, reads) {
-                log::error!("{e}");
-                load_error = Some(e);
+            if load_error.is_none() {
+                let mut reads = Vec::new();
+                for name in LIBRARY_FILES {
+                    reads.push((name, b.read(&library_key(&lib_dir, name)).await));
+                }
+                if let Err(e) = crate::files::preload_library(&files, reads) {
+                    log::error!("{e}");
+                    load_error = Some(e);
+                }
             }
         }
         let index_read = b.read(THUMB_INDEX).await;
@@ -446,12 +490,15 @@ async fn boot(opts: Options, bridge: Option<crate::host::Bridge>) -> Boot {
             Ok(None) => {}
             Err(e) => log::warn!("reading the thumbnail index: {e}"),
         }
-        crate::backend::request_persistence(|granted| {
+        let account_cache = opts.scope.is_some();
+        crate::backend::request_persistence(move |granted| {
             if !granted {
-                notice(
+                notice(if account_cache {
+                    "This browser may clear its local photo cache. LightCraft can retrieve saved originals from your account again."
+                } else {
                     "This browser may delete LightCraft's library when it runs short of space (persistent storage wasn't granted). \
-                     Keep your original photos elsewhere and use File ▸ Back Up Library… now and then.",
-                );
+                     Keep your original photos elsewhere and use File ▸ Back Up Library… now and then."
+                });
             }
         });
         // thumbnails stored without an index entry (index saved late, or lost): delete them; not
@@ -482,7 +529,7 @@ async fn boot(opts: Options, bridge: Option<crate::host::Bridge>) -> Boot {
         index.len(),
         index.total() as f64 / 1e6
     );
-    Boot { opts, backend, files, index, lib_dir, bridge, load_error }
+    Boot { opts, backend, files, index, lib_dir, bridge, account: None, load_error }
 }
 
 struct WebApp {
@@ -504,6 +551,7 @@ struct WebApp {
     last_save: f64,
     ui_written: Vec<u8>,
     bridge: Option<crate::host::Bridge>,
+    account: Option<AccountLibrary>,
 }
 
 /// The browser host's drop queues, taken only through the shared gate: a prompt or blocking
@@ -538,7 +586,7 @@ impl WebApp {
     /// browser storage (a read failure starts an empty session and a blocking `LibraryProblem`),
     /// load the stored UI state, start render workers and the optional benchmark.
     fn new(cc: &eframe::CreationContext<'_>, boot: Boot, chinese_font: Vec<u8>) -> Self {
-        let Boot { opts, backend, files, index, lib_dir, bridge, load_error } = boot;
+        let Boot { opts, backend, files, index, lib_dir, bridge, account, load_error } = boot;
         let originals = Originals::default();
         let t = perf_now();
         let mut session = Session::new();
@@ -554,7 +602,7 @@ impl WebApp {
         let read_failed = load_error.is_some();
         let opened = match load_error {
             Some(e) => Err(format!("{e}. Nothing was changed in storage")),
-            None => session.open_library_in(stores, true).cloned().map_err(|e| e.to_string()),
+            None => session.open_library_in(stores, account.is_none()).cloned().map_err(|e| e.to_string()),
         };
         match opened {
             Ok(r) => log::info!(
@@ -566,6 +614,9 @@ impl WebApp {
                 r.replayed
             ),
             Err(e) => {
+                if let Some((account, request)) = &account {
+                    account.port.open_failed(&request.request_id, &e);
+                }
                 // never a silent demo session (issue #100): an empty one, and the window says why
                 log::error!("opening the library failed: {e}");
                 session = Session::new();
@@ -583,7 +634,7 @@ impl WebApp {
         if opts.bench && backend.is_none() && session.catalog.len() == 0 {
             lightcraft_engine::demo::load(&mut session);
         }
-        if backend.is_some() {
+        if backend.is_some() && account.is_none() {
             notice(
                 "LightCraft in the browser is experimental. Your library is kept in this browser's storage: keep your original photos \
                  elsewhere and back up with File ▸ Back Up Library….",
@@ -593,7 +644,13 @@ impl WebApp {
         session.media.preview_capacity = 3;
         // nothing is saved while the stored library couldn't be read
         let frozen = Rc::new(Cell::new(read_failed));
-        let services = services(originals.clone(), backend.clone(), files.clone(), frozen.clone(), cc.egui_ctx.clone(), bridge.clone());
+        let account_library = account.as_ref().map(|(library, _)| library.clone());
+        let mut services =
+            services(originals.clone(), backend.clone(), files.clone(), frozen.clone(), cc.egui_ctx.clone(), bridge.clone(), account_library.clone());
+        if account.is_some() {
+            services.backup_library = None;
+            services.restore_library = None;
+        }
         let mut app = LightcraftApp::new(session, services).with_chinese_font(chinese_font);
         let ui_written = files.get("ui.json").unwrap_or_default();
         // an arrangement from an older docking version starts again from the default
@@ -615,14 +672,20 @@ impl WebApp {
         });
         let cache = app.session.media.rendered.clone();
         let workers = (n > 0).then(|| {
+            let store = match (backend.as_ref(), opts.scope.as_ref()) {
+                (Some(backend), Some(scope)) => scope.worker_store(backend.kind()),
+                (Some(backend), None) => backend.kind().to_owned(),
+                (None, _) => "memory".to_owned(),
+            };
             Workers::start(
                 n,
-                backend.as_ref().map_or("memory", |b| b.kind()),
+                &store,
                 backend.clone(),
                 index,
                 &cache,
                 app.session.cache_bytes(),
                 cc.egui_ctx.clone(),
+                account_library.as_ref().map(|account| (account.clone(), originals.clone())),
             )
         });
         if let Some(w) = &workers {
@@ -638,6 +701,12 @@ impl WebApp {
             }
         }
         let origin = lightcraft_ui_egui::monotonic_ms();
+        if app.library_problem.is_none()
+            && let Some((account, request)) = &account
+            && let Err(error) = account.port.opened(request)
+        {
+            notice(error);
+        }
         WebApp {
             app,
             originals,
@@ -654,6 +723,7 @@ impl WebApp {
             last_save: 0.0,
             ui_written,
             bridge,
+            account: account_library,
         }
     }
 
@@ -664,7 +734,7 @@ impl WebApp {
         for m in bridge.take_incoming() {
             match m {
                 Incoming::Open { name, bytes } => {
-                    wasm_bindgen_futures::spawn_local(store_file(self.originals.clone(), self.backend.clone(), name, bytes, ctx.clone()));
+                    wasm_bindgen_futures::spawn_local(store_file(self.originals.clone(), self.backend.clone(), None, name, bytes, ctx.clone()));
                 }
                 Incoming::Refused(error) => {
                     if !bridge.post(&Outgoing::Failed(error)) {
@@ -712,10 +782,11 @@ impl WebApp {
         }
         for f in drained.dropped {
             let (originals, backend, ctx) = (self.originals.clone(), self.backend.clone(), ctx.clone());
+            let account = self.account.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let name = egui::DroppedFile::path(f.as_ref()).to_string_lossy().to_string();
                 match egui::DroppedFile::bytes_async(f.as_ref()).await {
-                    Ok(bytes) => store_file(originals, backend, name, bytes, ctx).await,
+                    Ok(bytes) => store_file(originals, backend, account, name, bytes, ctx).await,
                     Err(e) => notice(lightcraft_ui_egui::i18n::dropped_file_unreadable(&name, &e.to_string())),
                 }
             });
@@ -750,8 +821,17 @@ impl WebApp {
         let Some(b) = &self.backend else { return };
         for hash in self.originals.take_wanted() {
             let (b, originals, ctx) = (b.clone(), self.originals.clone(), ctx.clone());
+            let account = self.account.clone();
+            if account.as_ref().is_some_and(|account| !account.can_retry(&hash)) {
+                originals.load_failed(&hash);
+                continue;
+            }
             wasm_bindgen_futures::spawn_local(async move {
-                match b.read(&storage_key(&hash)).await {
+                let result = match &account {
+                    Some(account) => account.load_original(&b, &hash).await.map(Some),
+                    None => b.read(&storage_key(&hash)).await,
+                };
+                match result {
                     Ok(Some(bytes)) => {
                         originals.insert(&hash, Arc::from(bytes));
                         ctx.request_repaint();
@@ -763,6 +843,11 @@ impl WebApp {
                     Err(e) => {
                         log::warn!("loading original {hash}: {e}");
                         originals.load_failed(&hash);
+                        if let Some(account) = account {
+                            account.retry_later(&hash);
+                            notice(format!("A LightCraft original could not be loaded: {e}"));
+                            ctx.request_repaint_after(std::time::Duration::from_secs(10));
+                        }
                     }
                 }
             });
@@ -797,7 +882,8 @@ impl WebApp {
         }
         // after a failure, retry every couple of seconds rather than every frame
         let backing_off = self.files.error().is_some() && now - self.flush_failed_at.get() < SAVE_RETRY_MS;
-        if let Some(b) = &self.backend
+        if self.account.is_none()
+            && let Some(b) = &self.backend
             && self.files.is_dirty()
             && !self.flushing.get()
             && !backing_off
@@ -850,6 +936,10 @@ impl WebApp {
     fn run_inbox(&mut self) {
         let inbox = INBOX.with(|q| std::mem::take(&mut *q.borrow_mut()));
         for (id, params, (resolve, reject)) in inbox {
+            if self.account.is_some() {
+                let _ = reject.call1(&JsValue::NULL, &"Use the Desktop's authorized account commands.".into());
+                continue;
+            }
             let r = match crate::automation::params(&params) {
                 Err(e) => Err(format!("{id}: {e}")),
                 Ok(_) if id == "web.stats" => Ok(self.web_stats()),
@@ -970,7 +1060,13 @@ pub fn start(chinese_font: Vec<u8>) {
     if chinese_font.is_empty() {
         log::warn!("lightcraft: no Simplified Chinese font supplied; Chinese-only glyphs will show as boxes");
     }
-    let opts = Options::from_url();
+    let opts = match Options::from_url() {
+        Ok(opts) => opts,
+        Err(error) => {
+            safety::show_blocking(error);
+            return;
+        }
+    };
     // `?host=parent`: a same-origin page framing LightCraft hands photos in, stores what would
     // be downloaded and hears about unsaved changes (see `host`). `data-host="page"` on the
     // canvas opts a page in instead: it runs LightCraft in its own document and talks over DOM
@@ -979,7 +1075,22 @@ pub fn start(chinese_font: Vec<u8>) {
         .and_then(|w| w.document())
         .and_then(|d| d.get_element_by_id("lightcraft_canvas"))
         .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok());
-    let mode = crate::host::transport_for(canvas.as_ref().and_then(|c| c.get_attribute("data-host")).as_deref(), &opts.query);
+    let account = if opts.scope.is_some() {
+        match AccountPort::connect() {
+            Ok(port) => Some(port),
+            Err(error) => {
+                safety::show_blocking(&error);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let mode = if account.is_none() {
+        crate::host::transport_for(canvas.as_ref().and_then(|c| c.get_attribute("data-host")).as_deref(), &opts.query)
+    } else {
+        None
+    };
     let bridge = mode.and_then(|m| crate::host::Bridge::for_mode(m, canvas.as_ref()));
     if mode == Some(crate::host::Mode::Parent) && bridge.is_none() {
         log::warn!(
@@ -988,11 +1099,13 @@ pub fn start(chinese_font: Vec<u8>) {
     }
     wasm_bindgen_futures::spawn_local(async move {
         // one tab per library: two would each keep their own copy and overwrite each other's saves
-        if opts.store != "memory" && safety::acquire_tab_lock().await == Some(false) {
-            safety::show_blocking(
-                "LightCraft is already open in another tab or window of this browser.\n\n\
-                 Switch to that tab, or close it and reload this page. (Two tabs would overwrite each other's changes.)",
-            );
+        if opts.store != "memory" && safety::acquire_tab_lock(opts.scope.as_ref()).await == Some(false) {
+            let message =
+                "LightCraft is already open in another tab or window of this browser. Switch to that tab, or close it and reload this page.";
+            safety::show_blocking(message);
+            if let Some(port) = &account {
+                port.startup_failed(message);
+            }
             if let Some(b) = &bridge {
                 b.post(&Outgoing::Failed("LightCraft is already open in another tab or window of this browser".into()));
             }
@@ -1000,12 +1113,42 @@ pub fn start(chinese_font: Vec<u8>) {
         }
         let Some(canvas) = canvas else {
             log::error!("missing <canvas id=\"lightcraft_canvas\">");
+            if let Some(port) = &account {
+                port.startup_failed("LightCraft could not find its editor canvas.");
+            }
             if let Some(b) = &bridge {
                 b.post(&Outgoing::Failed("the page has no <canvas id=\"lightcraft_canvas\">".into()));
             }
             return;
         };
-        let boot = boot(opts, bridge.clone()).await;
+        let mut boot = boot(opts, bridge.clone()).await;
+        let mut opening = None;
+        if let Some(port) = &account {
+            if let Some(error) = &boot.load_error {
+                port.startup_failed(error);
+                safety::show_blocking(error);
+                return;
+            }
+            let mut request = match port.start().await {
+                Ok(request) => request,
+                Err(error) => {
+                    safety::show_blocking(&error);
+                    return;
+                }
+            };
+            match AccountLibrary::open(port.clone(), &mut request) {
+                Ok((library, files)) => {
+                    opening = Some(request.request_id.clone());
+                    boot.files = files;
+                    boot.account = Some((library, request));
+                }
+                Err(error) => {
+                    port.open_failed(&request.request_id, &error);
+                    safety::show_blocking(&error);
+                    return;
+                }
+            }
+        }
         let runner = eframe::WebRunner::new();
         let r = runner.start(canvas, eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(WebApp::new(cc, boot, chinese_font))))).await;
         match r {
@@ -1019,6 +1162,9 @@ pub fn start(chinese_font: Vec<u8>) {
             Err(e) => {
                 log::error!("LightCraft failed to start: {e:?}");
                 set_status(&format!("LightCraft failed to start: {e:?}"));
+                if let (Some(port), Some(request)) = (&account, opening) {
+                    port.open_failed(&request, "LightCraft could not start the browser renderer.");
+                }
                 if let Some(b) = &bridge {
                     b.post(&Outgoing::Failed(format!("{e:?}")));
                 }

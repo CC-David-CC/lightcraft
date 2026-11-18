@@ -95,12 +95,13 @@ const TAB_LOCK: &str = "lightcraft-library";
 /// Hold the library lock for as long as this page lives (Web Locks API). `Some(true)`: ours;
 /// `Some(false)`: another tab of this site has it; `None`: the browser can't tell (no Web Locks, or
 /// it refused the request).
-pub async fn acquire_tab_lock() -> Option<bool> {
+pub async fn acquire_tab_lock(scope: Option<&crate::storage_scope::StorageScope>) -> Option<bool> {
     let nav = Reflect::get(&js_sys::global(), &"navigator".into()).ok()?;
     let locks = Reflect::get(&nav, &"locks".into()).ok().filter(|l| !l.is_undefined() && !l.is_null())?;
     let request: js_sys::Function = Reflect::get(&locks, &"request".into()).ok()?.dyn_into().ok()?;
     let opts = js_sys::Object::new();
     Reflect::set(&opts, &"ifAvailable".into(), &true.into()).ok()?;
+    let lock_name = scope.map_or_else(|| TAB_LOCK.to_owned(), |scope| scope.name());
     let granted = js_sys::Promise::new(&mut |resolve, reject| {
         let cb = Closure::once_into_js(move |lock: JsValue| -> JsValue {
             let ours = !lock.is_null() && !lock.is_undefined();
@@ -109,7 +110,7 @@ pub async fn acquire_tab_lock() -> Option<bool> {
             if ours { js_sys::Promise::new(&mut |_, _| {}).into() } else { JsValue::NULL }
         });
         // a refused request never calls `cb`: settle with its error instead of waiting forever
-        match request.call3(&locks, &TAB_LOCK.into(), &opts, &cb) {
+        match request.call3(&locks, &lock_name.as_str().into(), &opts, &cb) {
             Ok(pending) => {
                 let catch = Reflect::get(&pending, &"catch".into()).ok().and_then(|c| c.dyn_into::<js_sys::Function>().ok());
                 if let Some(catch) = catch {

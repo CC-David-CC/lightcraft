@@ -57,6 +57,16 @@ struct Inner {
     loading: std::collections::HashSet<String>,
 }
 
+impl Inner {
+    fn request_load(&mut self, hash: &str) -> bool {
+        if self.loading.contains(hash) || self.wanted.iter().any(|key| key == hash) {
+            return false;
+        }
+        self.wanted.push(hash.to_owned());
+        true
+    }
+}
+
 /// Original bytes in memory, shared between the engine hooks and the host (cheap to clone).
 #[derive(Clone, Default)]
 pub struct Originals(Arc<Mutex<Inner>>);
@@ -102,9 +112,7 @@ impl Originals {
             v.1 = clock;
             return Some(v.0.clone());
         }
-        if !g.loading.contains(hash) && !g.wanted.iter().any(|w| w == hash) {
-            g.wanted.push(hash.to_string());
-        }
+        g.request_load(hash);
         None
     }
 
@@ -113,8 +121,10 @@ impl Originals {
     }
 
     /// Ask for the original behind `path` to be loaded into memory (no-op if it's there).
-    pub fn prefetch(&self, path: &str) {
-        let _ = self.get(path);
+    pub fn prefetch(&self, path: &str) -> bool {
+        let Some(hash) = hash_of_path(path) else { return false };
+        let mut g = self.lock();
+        !g.bytes.contains_key(hash) && g.request_load(hash)
     }
 
     /// Hashes to load from storage (they count as loading until [`Originals::insert`] or
