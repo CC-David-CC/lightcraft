@@ -1,9 +1,6 @@
 <p align="center">
   <a href="https://getartcraft.com/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/artcraft-logo-white.svg">
-      <img alt="ArtCraft" src="docs/brand/artcraft-logo.svg" width="200">
-    </picture>
+    ArtCraft
   </a>
 </p>
 
@@ -717,7 +714,7 @@ part of this repository and LightCraft, under [`docs/brand/LICENSE-brand.txt`](d
 Forks and modified versions must remove them.
 
 <p align="center">
-  <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
+  <a href="https://getartcraft.com/">ArtCraft</a><br>
   <sub>Made by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
 </p>
 
