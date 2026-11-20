@@ -1,9 +1,6 @@
 <p align="center">
   <a href="https://getartcraft.com/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/artcraft-logo-white.svg">
-      <img alt="ArtCraft" src="docs/brand/artcraft-logo.svg" width="200">
-    </picture>
+    ArtCraft
   </a>
 </p>
 
@@ -648,7 +645,7 @@ ArtCraft 團隊的商標，不在本授權範圍內。它們只能以未經修�
 <sub>Adobe、Photoshop、Illustrator、Premiere Pro、Lightroom、Acrobat、After Effects 與 InDesign 是 Adobe Inc. 在美國及／或其他國家的商標或註冊商標。LightCraft 是一個獨立的開源專案，與 Adobe Inc. 沒有任何關係，也未獲其贊助或認可；這些名稱僅用於說明它所相容的工作流程。</sub>
 
 <p align="center">
-  <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
+  <a href="https://getartcraft.com/">ArtCraft</a><br>
   <sub>由 <a href="https://getartcraft.com/">ArtCraft</a> 團隊與社群製作。</sub>
 </p>
 

@@ -1,9 +1,6 @@
 <p align="center">
   <a href="https://getartcraft.com/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/artcraft-logo-white.svg">
-      <img alt="ArtCraft" src="docs/brand/artcraft-logo.svg" width="200">
-    </picture>
+    ArtCraft
   </a>
 </p>
 
@@ -611,7 +608,7 @@ ArtCraft 团队的商标，不在本许可范围内。它们只能在未修改�
 分支和修改版本必须移除它们。
 
 <p align="center">
-  <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
+  <a href="https://getartcraft.com/">ArtCraft</a><br>
   <sub>由 <a href="https://getartcraft.com/">ArtCraft</a> 团队和社区制作。</sub>
 </p>
 
