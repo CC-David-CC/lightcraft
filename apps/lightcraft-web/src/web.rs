@@ -23,6 +23,7 @@ use crate::bench::Bench;
 use crate::files::{Files, FlushOp, LIBRARY_FILES};
 use crate::host::{Incoming, Outgoing};
 use crate::safety::{self, notice};
+use crate::storage_scope::StorageScope;
 use crate::store::{Originals, content_hash, download_name, storage_key};
 use crate::wire::ThumbIndex;
 use crate::workers::{THUMB_INDEX, Workers};
@@ -499,17 +500,18 @@ async fn boot(opts: Options, bridge: Option<crate::host::Bridge>) -> Boot {
             Ok(None) => {}
             Err(e) => log::warn!("reading the thumbnail index: {e}"),
         }
-        let account_cache = opts.scope.is_some();
-        crate::backend::request_persistence(move |granted| {
-            if !granted {
-                notice(if account_cache {
-                    "This browser may clear its local photo cache. LightCraft can retrieve saved originals from your account again."
-                } else {
-                    "This browser may delete LightCraft's library when it runs short of space (persistent storage wasn't granted). \
-                     Keep your original photos elsewhere and use File ▸ Back Up Library… now and then."
-                });
-            }
-        });
+        // Account originals are written to the server. Their replaceable local cache needs
+        // neither an automatic permission request nor a library-loss reminder.
+        if opts.scope.is_none() {
+            crate::backend::request_persistence(|granted| {
+                if !granted {
+                    notice(
+                        "This browser may delete LightCraft's library when it runs short of space (persistent storage wasn't granted). \
+                         Keep your original photos elsewhere and use File ▸ Back Up Library… now and then.",
+                    );
+                }
+            });
+        }
         // thumbnails stored without an index entry (index saved late, or lost): delete them; not
         // when the index couldn't be read, which would make every thumbnail look unindexed
         let b2 = b.clone();
@@ -541,6 +543,34 @@ async fn boot(opts: Options, bridge: Option<crate::host::Bridge>) -> Boot {
     Boot { opts, backend, files, index, lib_dir, bridge, account: None, load_error }
 }
 
+/// The startup tour belongs to the browser's account session, independently of the open project.
+struct AccountStartup {
+    storage: web_sys::Storage,
+    key: String,
+    seen_version: Option<String>,
+}
+
+impl AccountStartup {
+    fn open(scope: &StorageScope) -> Option<Self> {
+        let storage = window()?.local_storage().ok()??;
+        let key = format!("{}:seen-version", scope.name());
+        let seen_version = storage.get_item(&key).ok()?.filter(|version| !version.is_empty());
+        Some(Self { storage, key, seen_version })
+    }
+
+    fn record(&mut self, version: Option<&str>) {
+        let Some(version) = version.filter(|version| Some(*version) != self.seen_version.as_deref()) else {
+            return;
+        };
+        // The UI records on first paint. Write now so a window closed before the next save tick
+        // still remembers the tour. A denied storage write must never dirty the project.
+        if self.storage.set_item(&self.key, version).is_err() {
+            log::warn!("could not remember the LightCraft startup dialog in this browser");
+        }
+        self.seen_version = Some(version.to_owned());
+    }
+}
+
 struct WebApp {
     app: LightcraftApp,
     originals: Originals,
@@ -561,6 +591,7 @@ struct WebApp {
     ui_written: Vec<u8>,
     bridge: Option<crate::host::Bridge>,
     account: Option<AccountLibrary>,
+    account_startup: Option<AccountStartup>,
     account_document: Option<AccountDocument>,
 }
 
@@ -674,6 +705,10 @@ impl WebApp {
         if let Ok(ui) = serde_json::from_value::<UiState>(saved) {
             app.ui = ui;
         }
+        let account_startup = opts.scope.as_ref().and_then(AccountStartup::open);
+        if let Some(startup) = &account_startup {
+            app.ui.seen_version.clone_from(&startup.seen_version);
+        }
         app.ui = app.ui.sanitized();
         app.library_problem = problem;
         let n = opts.workers.unwrap_or_else(|| {
@@ -738,6 +773,7 @@ impl WebApp {
             ui_written,
             bridge,
             account: account_library,
+            account_startup,
             account_document,
         }
     }
@@ -1036,6 +1072,9 @@ impl eframe::App for WebApp {
         let ctx = ui.ctx().clone();
         self.import_dropped(&ctx);
         self.app.ui(ui);
+        if let Some(startup) = &mut self.account_startup {
+            startup.record(self.app.ui.seen_version.as_deref());
+        }
         self.report_account_document();
         // eframe's web runner ignores `ViewportCommand::Title`: name the open photo in the page title
         let dirty = self.account_document.as_ref().map_or_else(|| self.files.is_dirty() || self.flushing.get(), AccountDocument::dirty);

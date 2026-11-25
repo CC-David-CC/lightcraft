@@ -68,6 +68,7 @@ web-sys = { workspace = true, features = [
     "MessageEvent",
     "Navigator",
     "Performance",
+    "Storage",
     "StorageManager",
     "Url",
     "Window",
